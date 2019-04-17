@@ -65,6 +65,7 @@ class Domain:
 
         self.base_domain_name = get_public_suffix(self.domain_name)
 
+        # TODO: Don't scan for DMARC on base domain unless DMARC option was specified
         if self.base_domain_name != self.domain_name:
             if self.base_domain_name not in Domain.base_domains:
                 # Populate DMARC for parent.
@@ -80,22 +81,28 @@ class Domain:
         # Keep entire record for potential future use.
         self.mx_records = None
         self.mx_records_dnssec = None
+        self.mx_tlsa_records = None
+        self.mx_tlsa_records_valid = None
+        self.mx_tlsa_records_match_smtp_certificate = None
+        self.mx_tlsa_dnssec = None
         self.spf = None
         self.spf_dnssec = None
+        self.spf_ips = None
+        self.spf_count_ips = None
         self.dmarc = None
-        self.dmarc_dnssec = False
+        self.dmarc_dnssec = None
         self.dmarc_policy = None
         self.dmarc_subdomain_policy = None
         self.dmarc_pct = None
         self.dmarc_aggregate_uris = []
         self.dmarc_forensic_uris = []
-        self.dmarc_has_aggregate_uri = False
-        self.dmarc_has_forensic_uri = False
-        self.dmarc_reports_address_error = False
+        self.dmarc_has_aggregate_uri = None
+        self.dmarc_has_forensic_uri = None
+        self.dmarc_reports_address_error = None
 
         # Syntax validity - default spf to false as the lack of an SPF is a bad thing.
-        self.valid_spf = False
-        self.valid_dmarc = True
+        self.valid_spf = None
+        self.valid_dmarc = None
         self.syntax_errors = []
 
         # Mail Info
@@ -140,6 +147,11 @@ class Domain:
             result = len(filter(lambda x: self.starttls_results[x]['starttls'],
                                 self.starttls_results.keys())) > 0
         return result
+
+    def has_tlsa(self):
+        if self.mx_tlsa_records is not None:
+            return len(self.mx_tlsa_records) > 0
+        return None
 
     def has_spf(self):
         if self.spf is not None:
@@ -249,6 +261,7 @@ class Domain:
         return ans
 
     def generate_results(self):
+
         if len(self.starttls_results.keys()) == 0:
             domain_supports_smtp = None
             domain_supports_starttls = None
@@ -281,7 +294,7 @@ class Domain:
 
             ('SPF Record', self.has_spf()),
             ('SPF Record DNSSEC', self.spf_dnssec),
-            ('Valid SPF', self.valid_spf),
+            ('Valid SPF', self.has_spf() and self.valid_spf),
             ('SPF Results', format_list(self.spf)),
 
             ('DMARC Record', self.has_dmarc()),
@@ -303,6 +316,13 @@ class Domain:
             ('DMARC Has Aggregate Report URI', self.get_dmarc_has_aggregate_uri()),
             ('DMARC Has Forensic Report URI', self.get_dmarc_has_forensic_uri()),
             ('DMARC Reporting Address Acceptance Error', self.dmarc_reports_address_error),
+
+            ('SPF Number of IPs', self.spf_count_ips),
+            ('SPF IPs', self.spf_ips),
+            ('MX TLSA Record', self.has_tlsa()),
+            ('MX TLSA DNSSEC', self.mx_tlsa_dnssec),
+            ('MX TLSA Valid', self.mx_tlsa_records_valid),
+            ('MX TLSA Matches STARTTLS', self.mx_tlsa_records_match_smtp_certificate),
 
             ('Syntax Errors', format_list(self.syntax_errors)),
             ('Debug Info', format_list(self.debug_info))

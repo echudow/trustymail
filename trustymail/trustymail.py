@@ -8,12 +8,21 @@ from collections import OrderedDict
 import requests
 import smtplib
 import socket
+import ssl
 import spf
-
+import traceback
+import threading
 import DNS
 import dns.resolver
 import dns.reversename
 
+from sslyze.server_connectivity_tester import ServerConnectivityTester, ServerConnectivityError
+from sslyze.synchronous_scanner import SynchronousScanner
+from sslyze.plugins.certificate_info_plugin import CertificateInfoScanCommand
+from sslyze.ssl_settings import TlsWrappedProtocolEnum
+import cryptography
+from cryptography.hazmat.primitives import serialization
+import hashlib
 
 from trustymail.domain import get_public_suffix, Domain
 
@@ -22,6 +31,10 @@ _SMTP_CACHE = {}
 
 MAILTO_REGEX = re.compile(r"(mailto):([\w\-!#$%&'*+-/=?^_`{|}~][\w\-.!#$%&'*+-/=?^_`{|}~]*@[\w\-.]+)(!\w+)?")
 
+TEST_FOR_DNSSEC = None
+NEXT_NAMESERVER_NUMBER = 0
+
+CA_FILE = None
 
 def domain_list_from_url(url):
     if not url:
@@ -54,57 +67,289 @@ def domain_list_from_csv(csv_file):
 
     return domains
 
+init_lock = threading.RLock()
+
+def initialize_dnssec_test(options=None):
+    """ 
+    Checks whether the resolvers support DNSSEC and sets a flag whether to check 
+    for DNSSEC during scans
+    """
+    global TEST_FOR_DNSSEC, DNSSEC_RESOLVERS, CA_FILE, init_lock
+
+    # ensure that only one thread runs this init function, and have all threads wait until it finishes
+    init_lock.acquire()
+    if TEST_FOR_DNSSEC is not None:
+        init_lock.release()
+        return
+
+    if options and options.get('ca_file'):
+        CA_FILE = options['ca_file']
+    # default to not test for DNSSEC unless we know that the resolver supports it
+    logging.debug('Testing nameservers for DNSSEC support.')
+    try:
+        dnssec_nameservers = []
+        query = dns.message.make_query("gov", "NS", want_dnssec=True)
+        for nameserver in DNS_RESOLVERS:
+            try:
+                response = dns.query.tcp(query, nameserver, timeout=DNS_TIMEOUT)
+                if response is not None and (response.flags & dns.flags.AD):
+                    logging.debug('Nameserver supports DNSSEC: ' + nameserver)
+                    dnssec_nameservers.append(nameserver)
+                else:
+                    logging.debug('Nameserver does not support DNSSEC or had other error: ' + nameserver)
+            except Exception as err:
+                logging.debug('Nameserver does not support DNSSEC or had error: ' + nameserver)
+                handle_error('[INIT DNSSEC]', None, err)
+        if len(dnssec_nameservers) > 0:
+            TEST_FOR_DNSSEC = True
+            DNSSEC_RESOLVERS = dnssec_nameservers
+            logging.debug('Found nameservers that support DNSSEC. Enabling DNSSEC checks using only those nameservers.')
+        else:
+            logging.debug('No nameservers support DNSSEC. Disabling DNSSEC checks.')
+    except Exception as error:
+        handle_error('[INIT_DNSSEC]', None, error)
+    if not TEST_FOR_DNSSEC:
+        TEST_FOR_DNSSEC = False
+    init_lock.release()
+    return
+
+
+class DNSLookupResult():
+    """
+    An ordering of possible result states
+    """
+    NOERROR = 0
+    TIMEOUT = 1
+    SERVFAIL = 2
+    NXDOMAIN = 3
+    NOANSWER = 4
+    OTHERERROR = 5
+
+
+def do_dns_lookup(domain, domain_name, record_type):
+    """
+    Does the DNS lookup while also checking for DNSSEC and returns the answer 
+    and the DNSSEC result.
+    Takes in a domain object, the domain_name to lookup, and the DNS record type to lookup.
+    Returns DNS Lookup Result Code, DNS Answer, and DNSSEC status.
+    """
+    global NEXT_NAMESERVER_NUMBER
+    try:
+        nameservers = DNS_RESOLVERS
+        query_dnssec = False
+        # Only query for DNSSEC if it's enabled and can be checked
+        if TEST_FOR_DNSSEC:
+            nameservers = DNSSEC_RESOLVERS
+            query_dnssec = True
+        query = dns.message.make_query(domain_name, record_type, want_dnssec=query_dnssec)
+        # Try to rotate through the list of nameservers so we don't just send many queries against only one
+        nameserver_range = list(range(NEXT_NAMESERVER_NUMBER, len(nameservers))) + list(range(0, NEXT_NAMESERVER_NUMBER))
+        NEXT_NAMESERVER_NUMBER = (NEXT_NAMESERVER_NUMBER + 1) % len(nameservers)
+        for nameserver_num in nameserver_range:
+            nameserver = nameservers[nameserver_num]
+            result = DNSLookupResult.NOANSWER
+            try:
+                response = dns.query.tcp(query, nameserver, timeout=DNS_TIMEOUT)
+                if response:
+                    answer = []
+                    dnssec = False
+                    if not TEST_FOR_DNSSEC:
+                        dnssec = None
+                    elif response.flags & dns.flags.AD:
+                        dnssec = True
+                    logging.debug('{} query for {}: result {} (DNSSEC: {}), with {} answers from {}.'.format(domain_name, record_type, dns.rcode.to_text(response.rcode()), dnssec, str(len(response.answer)), nameserver))
+                    if response.rcode() == dns.rcode.NOERROR:
+                        result = DNSLookupResult.NOERROR
+                    elif response.rcode() == dns.rcode.NXDOMAIN:
+                        return DNSLookupResult.NXDOMAIN, None, dnssec
+                    elif response.rcode() == dns.rcode.NXRRSET or response.rcode == dns.rcode.NOTZONE:
+                        return DNSLookupResult.NOANSWER, None, dnssec
+                    elif response.rcode() == dns.rcode.SERVFAIL:
+                        result = DNSLookupResult.SERVFAIL
+                        continue
+                    else: 
+                        result = DNSLookupResult.OTHERERROR
+                        continue
+                    if response.answer:
+                        # Might have received multiple answers, find the one we want
+                        found = False
+                        for i in range(len(response.answer)):
+                            if not found and dns.rdatatype.to_text(response.answer[i].rdtype) == record_type:
+                                found = True
+                                answer = response.answer[i]
+                                logging.debug('{} {} query: Received DNS answer: [{}]'.format(domain_name, record_type, str(response.answer[0])))
+                            else:
+                                # Ignore RRSIGs since those are answers we asked for, but not what we need
+                                if response.answer[i].rdtype != dns.rdatatype.RRSIG:
+                                    logging.debug('{} {}: Received multiple DNS answers ([{}]).'.format(domain_name, record_type, str(response.answer[i])))
+                        if not found:
+                            answer = response.answer[0]
+                    else:
+                        result = DNSLookupResult.NOANSWER
+                    return result, answer, dnssec
+            except dns.exception.Timeout as err:
+                result = DNSLookupResult.TIMEOUT
+                handle_error('[{} {}]'.format(domain_name, record_type), domain, err)
+        return result, None, None
+    except Exception as error:
+        handle_error('[{} {}]'.format(domain_name, record_type), domain, error)
+        result = DNSLookupResult.OTHERERROR
+        return result, None, None
+
 
 def check_dnssec(domain, domain_name, record_type):
-    """Checks whether the domain has a record of type that is protected
+    """
+    Checks whether the domain has a record of type that is protected
     by DNSSEC or NXDOMAIN or NoAnswer that is protected by DNSSEC.
 
     TODO: Probably does not follow redirects (CNAMEs).  Should work on
     that in the future.
     """
+    if TEST_FOR_DNSSEC:
+        try:
+            query = dns.message.make_query(domain_name, record_type, want_dnssec=True)
+            for nameserver in DNSSEC_RESOLVERS:
+                response = dns.query.tcp(query, nameserver, timeout=DNS_TIMEOUT)
+                if response is not None:
+                    if response.flags & dns.flags.AD:
+                        return True
+                    else:
+                        return False
+        except Exception as error:
+            handle_error('[DNSSEC]', domain, error)
+            return None
+    return None
+
+
+TLSA_RECORDS = {}
+
+def tlsa_scan(domain, mail_server):
+    """
+    Find TLSA records for a mail server.
+    """
     try:
-        query = dns.message.make_query(domain_name, record_type, want_dnssec=True)
-        for nameserver in DNS_RESOLVERS:
-            response = dns.query.tcp(query, nameserver, timeout=DNS_TIMEOUT)
-            if response is not None:
-                if response.flags & dns.flags.AD:
-                    return True
-                else:
-                    return False
+        tlsa_query = '_25._tcp.{}'.format(mail_server)
+        if tlsa_query in TLSA_RECORDS.keys():
+            dns_lookup_code, answer, dnssec = TLSA_RECORDS[tlsa_query]
+        else:
+            dns_lookup_code, answer, dnssec = do_dns_lookup(domain, tlsa_query, 'TLSA')
+            TLSA_RECORDS[tlsa_query] = dns_lookup_code, answer, dnssec
+        if dnssec is False or domain.mx_tlsa_dnssec is None:
+            domain.mx_tlsa_dnssec = dnssec
+        if dns_lookup_code == DNSLookupResult.TIMEOUT or dns_lookup_code == DNSLookupResult.OTHERERROR:
+            return
+        if domain.mx_tlsa_records is None:
+            domain.mx_tlsa_records = []
+        if dns_lookup_code == DNSLookupResult.SERVFAIL or dns_lookup_code == DNSLookupResult.NXDOMAIN or dns_lookup_code == DNSLookupResult.NOANSWER:
+            domain.mx_tlsa_records_valid = False
+        if dns_lookup_code == DNSLookupResult.NOERROR:
+            domain.mx_tlsa_records.append(answer)
+            for tlsa_record in answer:
+                if tlsa_record.usage < 0 or tlsa_record > 3:
+                    domain.mx_tlsa_records_valid = False
+                if tlsa_record.selector < 0 or tlsa_record.selector > 1:
+                    domain.mx_tlsa_records_valid = False
+                if tlsa_record.mtype < 0 or tlsa_record.mtype > 2:
+                    domain.mx_tlsa_records_valid = False
+            if domain.mx_tlsa_records_valid is None:
+                domain.mx_tlsa_records_valid = True
     except Exception as error:
-        handle_error('[MX DNSSEC]', domain, error)
-        return None
+        handle_error('[TLSA]', domain, error)
 
 
 def mx_scan(resolver, domain):
+    """
+    Find the mail servers for a domain.
+    """
     try:
-        if domain.mx_records is None:
-            domain.mx_records = []
-        if domain.mail_servers is None:
-            domain.mail_servers = []
-        # Use TCP, since we care about the content and correctness of the
-        # records more than whether their records fit in a single UDP packet.
-        for record in resolver.query(domain.domain_name, 'MX', tcp=True):
-            domain.add_mx_record(record)
-        domain.mx_records_dnssec = check_dnssec(domain, domain.domain_name, 'MX')
-    except (dns.resolver.NoNameservers) as error:
-        # The NoNameServers exception means that we got a SERVFAIL response.
-        # These responses are almost always permanent, not temporary, so let's
-        # treat the domain as not live.
-        domain.is_live = False
-        handle_error('[MX]', domain, error)
-    except dns.resolver.NXDOMAIN as error:
-        domain.is_live = False
-        # NXDOMAIN can still have DNSSEC
-        domain.mx_records_dnssec = check_dnssec(domain, domain.domain_name, 'MX')
-        handle_error('[MX]', domain, error)
-    except (dns.resolver.NoAnswer) as error:
-        # NoAnswer can still have DNSSEC
-        domain.mx_records_dnssec = check_dnssec(domain, domain.domain_name, 'MX')
-        handle_error('[MX]', domain, error)
-    except dns.exception.Timeout as error:
-        domain.mx_records_dnssec = check_dnssec(domain, domain.domain_name, 'MX')
-        handle_error('[MX]', domain, error)
+        dns_lookup_code, answer, dnssec = do_dns_lookup(domain, domain.domain_name, 'MX')
+        domain.mx_records_dnssec = dnssec
+        if dns_lookup_code == DNSLookupResult.SERVFAIL or dns_lookup_code == DNSLookupResult.NXDOMAIN:
+            domain.is_live = False
+            if domain.mx_records is None:
+                domain.mx_records = []
+            if domain.mail_servers is None:
+                domain.mail_servers = []
+            handle_error('MX', domain, "Received SERVFAIL or NXDOMAIN")
+        elif dns_lookup_code == DNSLookupResult.NOANSWER:
+            if domain.mx_records is None:
+                domain.mx_records = []
+            if domain.mail_servers is None:
+                domain.mail_servers = []
+            handle_error('MX', domain, "Received NOANSWER")
+        elif dns_lookup_code == DNSLookupResult.TIMEOUT:
+            handle_error('MX', domain, "Received TIMEOUT")
+        elif dns_lookup_code == DNSLookupResult.NOERROR:
+            if domain.mx_records is None:
+                domain.mx_records = []
+            if domain.mail_servers is None:
+                domain.mail_servers = []
+            for record in answer:
+                domain.add_mx_record(record)    
+        else:
+            handle_error('MX', domain, "Received other error")
+        if domain.mail_servers:
+            for mail_server in domain.mail_servers:
+                tlsa_scan(domain, mail_server)
+    except Exception as error:
+        handle_error('MX', domain, error)
+
+
+def check_starttls_tlsa(domain, smtp_timeout, mail_server, port):
+    """Scan a mail server to see if its certificate matches the TLSA record
+
+    *** This is untested since SMTP is blocked on test infrastructure (but similar code works for TLSA records for HTTPS)
+    """
+    try:
+        tls_wrapped_protocol = TlsWrappedProtocolEnum.STARTTLS_SMTP
+        server_tester = ServerConnectivityTester(hostname=mail_server, port=port, tls_wrapped_protocol=tls_wrapped_protocol)
+        server_info = server_tester.perform(network_timeout=smtp_timeout)
+        scanner = SynchronousScanner(network_timeout=smtp_timeout)
+        certs = scanner.run_scan_command(server_info, CertificateInfoScanCommand(ca_file=CA_FILE))
+        cert_tlsa_match = None
+        for tlsa_record in domain.mx_tlsa_records:
+            if tlsa_record.usage == 3:
+                pass
+            elif tlsa_record.usage == 1:
+                # Check if cert is trusted
+                if not certs.successful_trust_store:
+                    cert_tlsa_match = False
+            else:
+                cert_tlsa_match = False
+                handle_error("STARTTLS_TLSA", domain, "Only TLSA Usage types 1 and 3 are currently implemented.")
+            
+            data = None
+            if tlsa_record.selector == 0:
+                data = certs.certificate_chain[0].public_bytes(serialization.Encoding.DER)
+            elif tlsa_record.selector == 1:
+                data = certs.certificate_chain[0].public_key().public_bytes(serialization.Encoding.DER, format=serialization.PublicFormat.SubjectPublicKeyInfo)
+            else:
+                cert_tlsa_match = False
+                handle_error("STARTTLS_TLSA", domain, "Only TLSA Selector types 0 and 1 are supported.")
+
+            hashed = None
+            if tlsa_record.mtype == 0:
+                hashed = data
+            elif tlsa_record.mtype == 1:
+                hashed = hashlib.sha256(data).digest()
+            elif tlsa_record.mtype == 2:
+                hashed = hashlib.sha512(data).digest()
+            else:
+                cert_tlsa_match = False
+                handle_error("STARTTLS_TLSA", domain, "Only TLSA Matching types 0, 1, and 2 are supported.")
+
+            # For now, if any TLSA record matches any mail server, then the match is True, 
+            # but it should probably be if all mail servers match a TLSA record then the match is True
+            if cert_tlsa_match != False and hashed and hashed == tlsa_record.cert:
+                domain.mx_tlsa_records_match_smtp_certificate = True
+                logging.debug("{}: Found TLSA record matches STARTTLS certificate for mail server {}.".format(domain.domain_name, mail_server))
+                return
+        
+        # No TLSA records matched the STARTTLS cert, so the match is False (unless we've had matches for other mail servers previously)
+        if domain.mx_tlsa_records_match_smtp_certificate is None:
+            domain.mx_tlsa_records_match_smtp_certificate = False
+    except Exception as error:
+        handle_error('STARTTLS_TLSA', domain, error)
 
 
 def starttls_scan(domain, smtp_timeout, smtp_localhost, smtp_ports, smtp_cache):
@@ -201,10 +446,67 @@ def starttls_scan(domain, smtp_timeout, smtp_localhost, smtp_ports, smtp_cache):
                 # Copy the results into the cache, if necessary
                 if smtp_cache:
                     _SMTP_CACHE[server_and_port] = domain.starttls_results[server_and_port]
+
+                # If there is a TLSA record, check and see if the TLSA record matches the STARTTLS cert
+                if domain.mx_tlsa_records:
+                    check_starttls_tlsa(domain, smtp_timeout, mail_server, port)
+
             else:
                 logging.debug('\tUsing cached results for ' + server_and_port)
                 # Copy the cached results into the domain object
                 domain.starttls_results[server_and_port] = _SMTP_CACHE[server_and_port]
+
+# All SPF include IPs
+all_includes = {}
+
+# SPF Regexes
+re_includes = re.compile(r'include:([^ ]+)')
+re_ips = re.compile(r'ip4:([^ ]+)')
+
+def find_spf_ips(domain, domain_name, spf_record_text):
+    """
+    Find all the IPs from all iterative includes in an SPF record
+    """
+    includes = []
+    ips = []
+    if not spf_record_text:
+        result, answer, dnssec = do_dns_lookup(domain, domain_name, 'TXT')
+        if result != DNSLookupResult.NOERROR:
+            return 0
+        spf_record_text = str(answer)
+    if "v=spf1" in str(spf_record_text):
+        for match in re_includes.finditer(spf_record_text):
+            include = str(match.group(1))
+            if not include in includes:
+                includes.append(include)
+                if not include in all_includes.keys():
+                    include_ips = find_spf_ips(domain, include, None)
+                    all_includes[include] = include_ips
+                ips = ips + all_includes[include]
+        for match in re_ips.finditer(spf_record_text):
+            ip = str(match.group(1))
+            if not ip in ips:
+                ips.append(ip)
+    return ips
+
+def count_spf_ips(domain, domain_name, spf_record_text):
+    """
+    Sums all the IPs in all the IP ranges that are included in an SPF record
+    """
+    try:
+        count = 0
+        ips = find_spf_ips(domain, domain_name, spf_record_text)
+        for ip in ips:
+            if '/' in ip:
+                bits = 32 - int(ip[(ip.index('/') + 1):])
+                count += pow(2,bits)
+            else:
+                count += 1
+        domain.spf_ips = ips
+        domain.spf_count_ips = count
+    except Exception as error:
+        handle_error("[SPF IPs]", domain, error)
+    return 
 
 
 def check_spf_record(record_text, expected_result, domain, strict=2):
@@ -250,6 +552,7 @@ def check_spf_record(record_text, expected_result, domain, strict=2):
 
         response_type = response[0]
         if response_type == 'temperror' or response_type == 'permerror':
+            domain.valid_spf = False
             handle_error('[SPF]', domain,
                          'SPF query returned {}: {}'.format(response_type,
                                                             response[2]))
@@ -272,6 +575,8 @@ def check_spf_record(record_text, expected_result, domain, strict=2):
                                                                                     response_type)
             handle_error('[SPF]', domain, msg)
     except spf.AmbiguityWarning as error:
+        # Is ambiguous okay?  Treat it as no okay for now.
+        domain.valid_spf = False
         handle_error('[SPF]', domain, error)
 
 
@@ -306,7 +611,17 @@ def get_spf_record_text(resolver, domain_name, domain, follow_redirect=False):
     try:
         # Use TCP, since we care about the content and correctness of the
         # records more than whether their records fit in a single UDP packet.
-        for record in resolver.query(domain_name, 'TXT', tcp=True):
+        result, answer, dnssec = do_dns_lookup(domain, domain_name, 'TXT')
+        domain.spf_dnssec = dnssec
+        if result == DNSLookupResult.NXDOMAIN or result == DNSLookupResult.SERVFAIL:
+            domain.is_live = False
+            handle_error('[SPF]', domain, "SPF lookup result was NXDOMAIN or SERVFAIL.")
+            return None
+        elif result == DNSLookupResult.NOANSWER or result == DNSLookupResult.TIMEOUT or result == DNSLookupResult.OTHERERROR:
+            handle_error('[SPF]', domain, "SPF lookup result had no answer, timed out, or had some other error.")
+            return None
+        for record in answer:
+        #for record in resolver.query(domain_name, 'TXT', tcp=True):
             record_text = remove_quotes(record.to_text())
 
             if not record_text.startswith('v=spf1'):
@@ -319,24 +634,10 @@ def get_spf_record_text(resolver, domain_name, domain, follow_redirect=False):
                 record_to_return = get_spf_record_text(resolver, redirect_domain_name, domain)
             else:
                 record_to_return = record_text
-        domain.spf_dnssec = check_dnssec(domain, domain.domain_name, 'TXT')
-    except (dns.resolver.NoNameservers) as error:
-        # The NoNameservers exception means that we got a SERVFAIL response.
-        # These responses are almost always permanent, not temporary, so let's
-        # treat the domain as not live.
-        domain.is_live = False
-        handle_error('[SPF]', domain, error)
-    except (dns.resolver.NXDOMAIN) as error:
-        domain.is_live = False
-        domain.spf_dnssec = check_dnssec(domain, domain.domain_name, 'TXT')
-        handle_error('[SPF]', domain, error)
-    except (dns.resolver.NoAnswer) as error:
-        domain.spf_dnssec = check_dnssec(domain, domain.domain_name, 'TXT')
-        handle_error('[SPF]', domain, error)
-    except (dns.exception.Timeout) as error:
-        domain.spf_dnssec = check_dnssec(domain, domain.domain_name, 'TXT')
-        handle_error('[SPF]', domain, error)
-    return record_to_return
+        return record_to_return
+    except Exception as err:
+        handle_error('[SPF]', domain, err)
+        return None
 
 
 def spf_scan(resolver, domain):
@@ -378,6 +679,7 @@ def spf_scan(resolver, domain):
             result = 'neutral'
 
         check_spf_record(record_text_following_redirect, result, domain)
+        count_spf_ips(domain, domain.domain_name, record_text_following_redirect)
 
 
 def parse_dmarc_report_uri(uri):
@@ -417,10 +719,14 @@ def dmarc_scan(resolver, domain):
         if domain.dmarc is None:
             domain.dmarc = []
         dmarc_domain = '_dmarc.%s' % domain.domain_name
-        # Use TCP, since we care about the content and correctness of the
-        # records more than whether their records fit in a single UDP packet.
-        all_records = resolver.query(dmarc_domain, 'TXT', tcp=True)
-        domain.dmarc_dnssec = check_dnssec(domain, dmarc_domain, 'TXT')
+        result, answer, dnssec = do_dns_lookup(domain, dmarc_domain, 'TXT')
+        domain.dmarc_dnssec = dnssec
+        if result != DNSLookupResult.NOERROR:
+            handle_error('[DMARC]', domain, "Unable to lookup DMARC record or no good answer.")
+            return
+
+        all_records = answer
+       
         # According to step 4 in section 6.6.3 of the RFC
         # (https://tools.ietf.org/html/rfc7489#section-6.6.3), "Records that do
         # not start with a "v=" tag that identifies the current version of
@@ -591,19 +897,15 @@ def dmarc_scan(resolver, domain):
             # usefulness of DMARC.
             if 'p' in tag_dict and 'rua' not in tag_dict and 'ruf' not in tag_dict:
                 handle_syntax_error('[DMARC]', domain, 'Warning: A DMARC policy is specified but no reporting URIs.  This makes the DMARC implementation considerably less useful than it could be.  See https://tools.ietf.org/html/rfc7489#section-6.5 for more details.')
-
+            if domain.valid_dmarc is None:
+                domain.valid_dmarc = True
+        else:
+            if domain.valid_dmarc is None:
+                domain.valid_dmarc = False
         domain.dmarc_has_aggregate_uri = len(domain.dmarc_aggregate_uris) > 0
         domain.dmarc_has_forensic_uri = len(domain.dmarc_forensic_uris) > 0
-    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.exception.Timeout) as error:
-        domain.dmarc_dnssec = check_dnssec(domain, dmarc_domain, 'TXT')
-        handle_error('[DMARC]', domain, error)
-    except (dns.resolver.NoNameservers) as error:
-        # Normally we count a NoNameservers exception as indicating
-        # that a domain is "not live".  In this case we don't, though,
-        # since the DMARC DNS check doesn't query for the domain name
-        # itself.  If the domain name is domain.com, the DMARC DNS
-        # check queries for _dmarc.domain.com.
-        handle_error('[DMARC]', domain, error)
+    except Exception as err:
+        handle_error('[DMARC]', domain, err)
 
 
 def find_host_from_ip(resolver, ip_addr):
@@ -617,7 +919,7 @@ def scan(domain_name, timeout, smtp_timeout, smtp_localhost, smtp_ports, smtp_ca
     #
     # Configure the dnspython library
     #
-    global DNS_TIMEOUT, DNS_RESOLVERS
+    global DNS_TIMEOUT, DNS_RESOLVERS, DNSSEC_RESOLVERS, TEST_FOR_DNSSEC
 
     # Our resolver
     #
@@ -660,6 +962,9 @@ def scan(domain_name, timeout, smtp_timeout, smtp_localhost, smtp_ports, smtp_ca
     # If the user passed in DNS hostnames to query against then use them
     if dns_hostnames:
         DNS.defaults['server'] = dns_hostnames
+
+    if TEST_FOR_DNSSEC is None:
+        initialize_dnssec_test()
 
     # Domain's constructor needs all these parameters because it does a DMARC
     # scan in its init
@@ -723,7 +1028,7 @@ def handle_error(prefix, domain, error, syntax_error=False):
     """
     # Get the previous frame in the stack - the one that is calling
     # this function
-    frame = inspect.currentframe().f_back
+    frame = inspect.currentframe().f_back  
     function = frame.f_code
     function_name = function.co_name
     filename = function.co_filename
@@ -732,7 +1037,7 @@ def handle_error(prefix, domain, error, syntax_error=False):
     error_template = '{prefix} In {function_name} at {filename}:{line}: {error}'
 
     if hasattr(error, 'message'):
-        if syntax_error and 'NXDOMAIN' in error.message and prefix != '[DMARC]':
+        if domain and syntax_error and 'NXDOMAIN' in error.message and prefix != '[DMARC]':
             domain.is_live = False
         error_string = error_template.format(prefix=prefix, function_name=function_name, line=line, filename=filename,
                                              error=error.message)
@@ -740,11 +1045,15 @@ def handle_error(prefix, domain, error, syntax_error=False):
         error_string = error_template.format(prefix=prefix, function_name=function_name, line=line, filename=filename,
                                              error=str(error))
 
-    if syntax_error:
-        domain.syntax_errors.append(error_string)
-    else:
-        domain.debug_info.append(error_string)
+    if domain:
+        if syntax_error:
+            domain.syntax_errors.append(error_string)
+        else:
+            domain.debug_info.append(error_string)
     logging.debug(error_string)
+    #if error is not None and isinstance(error, Exception):
+    #    logging.debug("Error is an Exception:  ")
+    #    logging.debug(traceback.format_tb(error.__traceback__))
 
 
 def handle_syntax_error(prefix, domain, error):
@@ -767,7 +1076,8 @@ def generate_csv(domains, file_name):
 def generate_json(domains):
     output = []
     for domain in domains:
-        output.append(domain.generate_results())
+        results = domain.generate_results()
+        output.append(results)
 
     return json.dumps(output, indent=2, default=format_datetime)
 
