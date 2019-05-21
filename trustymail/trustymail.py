@@ -15,6 +15,7 @@ import threading
 import DNS
 import dns.resolver
 import dns.reversename
+import time
 
 from sslyze.server_connectivity_tester import ServerConnectivityTester, ServerConnectivityError
 from sslyze.synchronous_scanner import SynchronousScanner
@@ -35,6 +36,15 @@ TEST_FOR_DNSSEC = None
 NEXT_NAMESERVER_NUMBER = 0
 
 CA_FILE = None
+
+# Synchronization lock between threads to ensure that only one thread runs the 
+# initialization function, but that all threads wait for it to finish before 
+# they continue
+init_lock = threading.RLock()
+
+RETRY_SERVFAIL = True
+RETRY_SERVFAIL_WAIT = 10
+RETRY_SERVFAIL_TIMES = 2
 
 def domain_list_from_url(url):
     if not url:
@@ -67,7 +77,6 @@ def domain_list_from_csv(csv_file):
 
     return domains
 
-init_lock = threading.RLock()
 
 def initialize_dnssec_test(options=None):
     """ 
@@ -133,68 +142,76 @@ def do_dns_lookup(domain, domain_name, record_type):
     Takes in a domain object, the domain_name to lookup, and the DNS record type to lookup.
     Returns DNS Lookup Result Code, DNS Answer, and DNSSEC status.
     """
-    global NEXT_NAMESERVER_NUMBER
-    try:
-        nameservers = DNS_RESOLVERS
-        query_dnssec = False
-        # Only query for DNSSEC if it's enabled and can be checked
-        if TEST_FOR_DNSSEC:
-            nameservers = DNSSEC_RESOLVERS
-            query_dnssec = True
-        query = dns.message.make_query(domain_name, record_type, want_dnssec=query_dnssec)
-        # Try to rotate through the list of nameservers so we don't just send many queries against only one
-        nameserver_range = list(range(NEXT_NAMESERVER_NUMBER, len(nameservers))) + list(range(0, NEXT_NAMESERVER_NUMBER))
-        NEXT_NAMESERVER_NUMBER = (NEXT_NAMESERVER_NUMBER + 1) % len(nameservers)
-        for nameserver_num in nameserver_range:
-            nameserver = nameservers[nameserver_num]
-            result = DNSLookupResult.NOANSWER
-            try:
-                response = dns.query.tcp(query, nameserver, timeout=DNS_TIMEOUT)
-                if response:
-                    answer = []
-                    dnssec = False
-                    if not TEST_FOR_DNSSEC:
-                        dnssec = None
-                    elif response.flags & dns.flags.AD:
-                        dnssec = True
-                    logging.debug('{} query for {}: result {} (DNSSEC: {}), with {} answers from {}.'.format(domain_name, record_type, dns.rcode.to_text(response.rcode()), dnssec, str(len(response.answer)), nameserver))
-                    if response.rcode() == dns.rcode.NOERROR:
-                        result = DNSLookupResult.NOERROR
-                    elif response.rcode() == dns.rcode.NXDOMAIN:
-                        return DNSLookupResult.NXDOMAIN, None, dnssec
-                    elif response.rcode() == dns.rcode.NXRRSET or response.rcode == dns.rcode.NOTZONE:
-                        return DNSLookupResult.NOANSWER, None, dnssec
-                    elif response.rcode() == dns.rcode.SERVFAIL:
-                        result = DNSLookupResult.SERVFAIL
-                        continue
-                    else: 
-                        result = DNSLookupResult.OTHERERROR
-                        continue
-                    if response.answer:
-                        # Might have received multiple answers, find the one we want
-                        found = False
-                        for i in range(len(response.answer)):
-                            if not found and dns.rdatatype.to_text(response.answer[i].rdtype) == record_type:
-                                found = True
-                                answer = response.answer[i]
-                                logging.debug('{} {} query: Received DNS answer: [{}]'.format(domain_name, record_type, str(response.answer[0])))
-                            else:
-                                # Ignore RRSIGs since those are answers we asked for, but not what we need
-                                if response.answer[i].rdtype != dns.rdatatype.RRSIG:
-                                    logging.debug('{} {}: Received multiple DNS answers ([{}]).'.format(domain_name, record_type, str(response.answer[i])))
-                        if not found:
-                            answer = response.answer[0]
-                    else:
-                        result = DNSLookupResult.NOANSWER
-                    return result, answer, dnssec
-            except dns.exception.Timeout as err:
-                result = DNSLookupResult.TIMEOUT
-                handle_error('[{} {}]'.format(domain_name, record_type), domain, err)
-        return result, None, None
-    except Exception as error:
-        handle_error('[{} {}]'.format(domain_name, record_type), domain, error)
+    global NEXT_NAMESERVER_NUMBER, RETRY_SERVFAIL, RETRY_SERVFAIL_WAIT, RETRY_SERVFAIL_TIMES
+    for retry_number in range(0, RETRY_SERVFAIL_TIMES):  
+        try:
+            nameservers = DNS_RESOLVERS
+            query_dnssec = False
+            # Only query for DNSSEC if it's enabled and can be checked
+            if TEST_FOR_DNSSEC:
+                nameservers = DNSSEC_RESOLVERS
+                query_dnssec = True
+            query = dns.message.make_query(domain_name, record_type, want_dnssec=query_dnssec)
+            # Try to rotate through the list of nameservers so we don't just send many queries against only one
+            nameserver_range = list(range(NEXT_NAMESERVER_NUMBER, len(nameservers))) + list(range(0, NEXT_NAMESERVER_NUMBER))
+            NEXT_NAMESERVER_NUMBER = (NEXT_NAMESERVER_NUMBER + 1) % len(nameservers)
+            for nameserver_num in nameserver_range:
+                nameserver = nameservers[nameserver_num]
+                result = DNSLookupResult.NOANSWER
+                try:
+                    response = dns.query.tcp(query, nameserver, timeout=DNS_TIMEOUT)
+                    if response:
+                        answer = []
+                        dnssec = False
+                        if not TEST_FOR_DNSSEC:
+                            dnssec = None
+                        elif response.flags & dns.flags.AD:
+                            dnssec = True
+                        logging.debug('{} query for {}: result {} (DNSSEC: {}), with {} answers from {}.'.format(domain_name, record_type, dns.rcode.to_text(response.rcode()), dnssec, str(len(response.answer)), nameserver))
+                        if response.rcode() == dns.rcode.NOERROR:
+                            result = DNSLookupResult.NOERROR
+                        elif response.rcode() == dns.rcode.NXDOMAIN:
+                            return DNSLookupResult.NXDOMAIN, None, dnssec
+                        elif response.rcode() == dns.rcode.NXRRSET or response.rcode == dns.rcode.NOTZONE:
+                            return DNSLookupResult.NOANSWER, None, dnssec
+                        elif response.rcode() == dns.rcode.SERVFAIL:
+                            result = DNSLookupResult.SERVFAIL
+                            continue
+                        else: 
+                            result = DNSLookupResult.OTHERERROR
+                            continue
+                        if response.answer:
+                            # Might have received multiple answers, find the one we want
+                            found = False
+                            for i in range(len(response.answer)):
+                                if not found and dns.rdatatype.to_text(response.answer[i].rdtype) == record_type:
+                                    found = True
+                                    answer = response.answer[i]
+                                    logging.debug('{} {} query: Received DNS answer: [{}]'.format(domain_name, record_type, str(response.answer[0])))
+                                else:
+                                    # Ignore RRSIGs since those are answers we asked for, but not what we need
+                                    if response.answer[i].rdtype != dns.rdatatype.RRSIG:
+                                        logging.debug('{} {}: Received multiple DNS answers ([{}]).'.format(domain_name, record_type, str(response.answer[i])))
+                            if not found:
+                                answer = response.answer[0]
+                        else:
+                            result = DNSLookupResult.NOANSWER
+                        return result, answer, dnssec
+                except dns.exception.Timeout as err:
+                    result = DNSLookupResult.TIMEOUT
+                    handle_error('[{} {}]'.format(domain_name, record_type), domain, err)
+            if not RETRY_SERVFAIL or result != DNSLookupResult.SERVFAIL:
+                return result, None, None
+            else:
+                logging.debug('{} {}: Received SERVFAIL, waiting and then trying again...'.format(domain_name, record_type))
+                time.sleep(RETRY_SERVFAIL_WAIT)
+        except Exception as error:
+            handle_error('[{} {}]'.format(domain_name, record_type), domain, error)
+            result = DNSLookupResult.OTHERERROR
+            return result, None, None
+    if result != DNSLookupResult.SERVFAIL:
         result = DNSLookupResult.OTHERERROR
-        return result, None, None
+    return result, None, None
 
 
 def check_dnssec(domain, domain_name, record_type):
@@ -524,7 +541,7 @@ def find_spf_ips(domain, domain_name, spf_record_text):
     includes = []
     ips = []
     if not spf_record_text:
-        result, answer, dnssec = do_dns_lookup(domain, domain_name, 'TXT')
+        result, answer, _ = do_dns_lookup(domain, domain_name, 'TXT')
         if result != DNSLookupResult.NOERROR:
             return 0
         spf_record_text = str(answer)
