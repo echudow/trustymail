@@ -335,12 +335,27 @@ def check_starttls_tlsa(domain, smtp_timeout, mail_server, port):
         scanner = SynchronousScanner(network_timeout=smtp_timeout)
         certs = scanner.run_scan_command(server_info, CertificateInfoScanCommand(ca_file=CA_FILE))
         cert_tlsa_match = None
+        cert_is_trusted = None
+        received_chain = None
+        functions = dir(certs)
+        if "successful_trust_store" in functions:
+            cert_is_trusted = (certs.successful_trust_store is not None)
+        elif "verified_certificate_chain" in functions:
+            cert_is_trusted = (certs.verified_certificate_chain is not None)
+        else:
+            raise Exception("Missing sslyze function for whether certificate is trusted")
+        if "certificate_chain" in functions:
+            received_chain = certs.certificate_chain
+        elif "received_certificate_chain" in functions:
+            received_chain = certs.received_certificate_chain
+        else:
+            raise Exception("Missing sslyze function for received certificate chain")
         for tlsa_record in domain.mx_tlsa_records:
             if tlsa_record.usage == 3:
                 pass
             elif tlsa_record.usage == 1:
                 # Check if cert is trusted
-                if not certs.successful_trust_store:
+                if not cert_is_trusted:
                     cert_tlsa_match = False
             else:
                 cert_tlsa_match = False
@@ -348,9 +363,9 @@ def check_starttls_tlsa(domain, smtp_timeout, mail_server, port):
             
             data = None
             if tlsa_record.selector == 0:
-                data = certs.certificate_chain[0].public_bytes(serialization.Encoding.DER)
+                data = received_chain[0].public_bytes(serialization.Encoding.DER)
             elif tlsa_record.selector == 1:
-                data = certs.certificate_chain[0].public_key().public_bytes(serialization.Encoding.DER, format=serialization.PublicFormat.SubjectPublicKeyInfo)
+                data = received_chain[0].public_key().public_bytes(serialization.Encoding.DER, format=serialization.PublicFormat.SubjectPublicKeyInfo)
             else:
                 cert_tlsa_match = False
                 handle_error("STARTTLS_TLSA", domain, "Only TLSA Selector types 0 and 1 are supported.")
