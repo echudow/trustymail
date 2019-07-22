@@ -423,7 +423,7 @@ def starttls_scan(domain, smtp_timeout, smtp_localhost, smtp_ports, smtp_cache):
     mail_servers = domain.mail_servers
     if mail_servers is None:
         mail_servers = []
-    for mail_server in domain.mail_servers:
+    for mail_server in mail_servers:
         for port in smtp_ports:
             domain.ports_tested.add(port)
             server_and_port = mail_server + ':' + str(port)
