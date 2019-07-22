@@ -420,6 +420,9 @@ def starttls_scan(domain, smtp_timeout, smtp_localhost, smtp_ports, smtp_cache):
     smtp_cache : bool
         Whether or not to cache SMTP results.
     """
+    mail_servers = domain.mail_servers
+    if mail_servers is None:
+        mail_servers = []
     for mail_server in domain.mail_servers:
         for port in smtp_ports:
             domain.ports_tested.add(port)
