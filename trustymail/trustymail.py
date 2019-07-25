@@ -462,10 +462,10 @@ def starttls_scan(domain, smtp_timeout, smtp_localhost, smtp_ports, smtp_cache):
                     # We get this exception if there is no A record
                     # for the given mail server.  This does happen,
                     # since among their MX records some domains do
-                    # list some IPv6-only mail servers, but this also 
-                    # happens if there is a DNS error or if the mail 
-                    # server does not exist in DNS, so we can't give 
-                    # them credit and we'll just treat them as 
+                    # list some IPv6-only mail servers, but this also
+                    # happens if there is a DNS error or if the mail
+                    # server does not exist in DNS, so we can't give
+                    # them credit and we'll just treat them as
                     # unreachable instead.
                     error_str = f'The mail server {mail_server} does not have an IPv4 address.'
                     handle_error('[STARTTLS]', domain, error_str)
