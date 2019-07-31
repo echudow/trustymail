@@ -148,10 +148,12 @@ def do_dns_lookup(domain, domain_name, record_type):
             nameservers = DNS_RESOLVERS
             query_dnssec = False
             # Only query for DNSSEC if it's enabled and can be checked
-            if TEST_FOR_DNSSEC:
+            if TEST_FOR_DNSSEC and retry_number == 0:
                 nameservers = DNSSEC_RESOLVERS
                 query_dnssec = True
             query = dns.message.make_query(domain_name, record_type, want_dnssec=query_dnssec)
+            if retry_number > 0:
+                query.flags += dns.flags.CD
             # Try to rotate through the list of nameservers so we don't just send many queries against only one
             nameserver_range = list(range(NEXT_NAMESERVER_NUMBER, len(nameservers))) + list(range(0, NEXT_NAMESERVER_NUMBER))
             NEXT_NAMESERVER_NUMBER = (NEXT_NAMESERVER_NUMBER + 1) % len(nameservers)
