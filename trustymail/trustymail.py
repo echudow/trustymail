@@ -37,8 +37,8 @@ NEXT_NAMESERVER_NUMBER = 0
 
 CA_FILE = None
 
-# Synchronization lock between threads to ensure that only one thread runs the 
-# initialization function, but that all threads wait for it to finish before 
+# Synchronization lock between threads to ensure that only one thread runs the
+# initialization function, but that all threads wait for it to finish before
 # they continue
 init_lock = threading.RLock()
 
@@ -79,8 +79,8 @@ def domain_list_from_csv(csv_file):
 
 
 def initialize_dnssec_test(options=None):
-    """ 
-    Checks whether the resolvers support DNSSEC and sets a flag whether to check 
+    """
+    Checks whether the resolvers support DNSSEC and sets a flag whether to check
     for DNSSEC during scans
     """
     global TEST_FOR_DNSSEC, DNSSEC_RESOLVERS, CA_FILE, init_lock
@@ -137,13 +137,13 @@ class DNSLookupResult():
 
 def do_dns_lookup(domain, domain_name, record_type):
     """
-    Does the DNS lookup while also checking for DNSSEC and returns the answer 
+    Does the DNS lookup while also checking for DNSSEC and returns the answer
     and the DNSSEC result.
     Takes in a domain object, the domain_name to lookup, and the DNS record type to lookup.
     Returns DNS Lookup Result Code, DNS Answer, and DNSSEC status.
     """
     global NEXT_NAMESERVER_NUMBER, RETRY_SERVFAIL, RETRY_SERVFAIL_WAIT, RETRY_SERVFAIL_TIMES
-    for retry_number in range(0, RETRY_SERVFAIL_TIMES):  
+    for retry_number in range(0, RETRY_SERVFAIL_TIMES):
         try:
             nameservers = DNS_RESOLVERS
             query_dnssec = False
@@ -154,6 +154,7 @@ def do_dns_lookup(domain, domain_name, record_type):
             query = dns.message.make_query(domain_name, record_type, want_dnssec=query_dnssec)
             if retry_number > 0:
                 query.flags += dns.flags.CD
+                logging.debug("{}: query_dnssec = {}, flags = {}".format(domain_name, query_dnssec, dns.flags.to_text(query.flags)))
             # Try to rotate through the list of nameservers so we don't just send many queries against only one
             nameserver_range = list(range(NEXT_NAMESERVER_NUMBER, len(nameservers))) + list(range(0, NEXT_NAMESERVER_NUMBER))
             NEXT_NAMESERVER_NUMBER = (NEXT_NAMESERVER_NUMBER + 1) % len(nameservers)
@@ -179,7 +180,7 @@ def do_dns_lookup(domain, domain_name, record_type):
                         elif response.rcode() == dns.rcode.SERVFAIL:
                             result = DNSLookupResult.SERVFAIL
                             continue
-                        else: 
+                        else:
                             result = DNSLookupResult.OTHERERROR
                             continue
                         if response.answer:
@@ -264,7 +265,8 @@ def tlsa_scan(domain, mail_server):
         if dns_lookup_code == DNSLookupResult.NOERROR:
             domain.mx_tlsa_records.append(answer)
             for tlsa_record in answer:
-                if tlsa_record.usage < 0 or tlsa_record > 3:
+                #logging.debug("{}: Checking usage.".format(domain.domain_name))
+                if tlsa_record.usage < 0 or tlsa_record.usage > 3:
                     domain.mx_tlsa_records_valid = False
                 if tlsa_record.selector < 0 or tlsa_record.selector > 1:
                     domain.mx_tlsa_records_valid = False
@@ -315,7 +317,7 @@ def mx_scan(resolver, domain):
             if domain.mail_servers is None:
                 domain.mail_servers = []
             for record in answer:
-                domain.add_mx_record(record)    
+                domain.add_mx_record(record)
         else:
             handle_error('MX', domain, "Received other error")
         if domain.mail_servers:
@@ -362,7 +364,7 @@ def check_starttls_tlsa(domain, smtp_timeout, mail_server, port):
             else:
                 cert_tlsa_match = False
                 handle_error("STARTTLS_TLSA", domain, "Only TLSA Usage types 1 and 3 are currently implemented.")
-            
+
             data = None
             if tlsa_record.selector == 0:
                 data = received_chain[0].public_bytes(serialization.Encoding.DER)
@@ -383,13 +385,13 @@ def check_starttls_tlsa(domain, smtp_timeout, mail_server, port):
                 cert_tlsa_match = False
                 handle_error("STARTTLS_TLSA", domain, "Only TLSA Matching types 0, 1, and 2 are supported.")
 
-            # For now, if any TLSA record matches any mail server, then the match is True, 
+            # For now, if any TLSA record matches any mail server, then the match is True,
             # but it should probably be if all mail servers match a TLSA record then the match is True
             if cert_tlsa_match != False and hashed and hashed == tlsa_record.cert:
                 domain.mx_tlsa_records_match_smtp_certificate = True
                 logging.debug("{}: Found TLSA record matches STARTTLS certificate for mail server {}.".format(domain.domain_name, mail_server))
                 return
-        
+
         # No TLSA records matched the STARTTLS cert, so the match is False (unless we've had matches for other mail servers previously)
         if domain.mx_tlsa_records_match_smtp_certificate is None:
             domain.mx_tlsa_records_match_smtp_certificate = False
@@ -597,7 +599,7 @@ def count_spf_ips(domain, domain_name, spf_record_text):
         domain.spf_count_ips = count
     except Exception as error:
         handle_error("[SPF IPs]", domain, error)
-    return 
+    return
 
 
 def check_spf_record(record_text, domain, strict=2):
@@ -810,7 +812,7 @@ def dmarc_scan(resolver, domain):
             return
 
         all_records = answer
-       
+
         # According to step 4 in section 6.6.3 of the RFC
         # (https://tools.ietf.org/html/rfc7489#section-6.6.3), "Records that do
         # not start with a "v=" tag that identifies the current version of
@@ -1117,7 +1119,7 @@ def handle_error(prefix, domain, error, syntax_error=False):
     """
     # Get the previous frame in the stack - the one that is calling
     # this function
-    frame = inspect.currentframe().f_back  
+    frame = inspect.currentframe().f_back
     function = frame.f_code
     function_name = function.co_name
     filename = function.co_filename
