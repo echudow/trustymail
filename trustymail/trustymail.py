@@ -23,7 +23,11 @@ from sslyze.plugins.certificate_info_plugin import CertificateInfoScanCommand
 from sslyze.ssl_settings import TlsWrappedProtocolEnum
 import cryptography
 from cryptography.hazmat.primitives import serialization
+
+from OpenSSL import crypto
+from cryptography.hazmat.backends import default_backend
 import hashlib
+import binascii
 
 from trustymail.domain import get_public_suffix, Domain
 
@@ -249,6 +253,7 @@ def tlsa_scan(domain, mail_server):
     """
     try:
         tlsa_query = '_25._tcp.{}'.format(mail_server)
+        # TODO: it could be on another port, so should check those too
         if tlsa_query in TLSA_RECORDS.keys():
             dns_lookup_code, answer, dnssec = TLSA_RECORDS[tlsa_query]
         else:
@@ -272,6 +277,7 @@ def tlsa_scan(domain, mail_server):
                     domain.mx_tlsa_records_valid = False
                 if tlsa_record.mtype < 0 or tlsa_record.mtype > 2:
                     domain.mx_tlsa_records_valid = False
+                logging.debug("{}: Found TLSA record with usage {}, selector {}, mtype {}, and cert data '{}'.".format(domain.domain_name, tlsa_record.usage, tlsa_record.selector, tlsa_record.mtype, binascii.b2a_hex(tlsa_record.cert)))
             if domain.mx_tlsa_records_valid is None:
                 domain.mx_tlsa_records_valid = True
     except Exception as error:
@@ -327,19 +333,21 @@ def mx_scan(resolver, domain):
         handle_error('MX', domain, error)
 
 
-def check_starttls_tlsa(domain, smtp_timeout, mail_server, port):
+def check_starttls_tlsa(domain, smtp_connection, smtp_timeout, mail_server, port):
     """Scan a mail server to see if its certificate matches the TLSA record
 
     *** This is untested since SMTP is blocked on test infrastructure (but similar code works for TLSA records for HTTPS)
     """
+    cert_tlsa_check = True
+    #cert_is_trusted = None
+
     try:
+        """ * old sslyze attempt, may come back to this... *
         tls_wrapped_protocol = TlsWrappedProtocolEnum.STARTTLS_SMTP
         server_tester = ServerConnectivityTester(hostname=mail_server, port=port, tls_wrapped_protocol=tls_wrapped_protocol)
         server_info = server_tester.perform(network_timeout=smtp_timeout)
         scanner = SynchronousScanner(network_timeout=smtp_timeout)
         certs = scanner.run_scan_command(server_info, CertificateInfoScanCommand(ca_file=CA_FILE))
-        cert_tlsa_match = None
-        cert_is_trusted = None
         received_chain = None
         functions = dir(certs)
         if "successful_trust_store" in functions:
@@ -354,46 +362,72 @@ def check_starttls_tlsa(domain, smtp_timeout, mail_server, port):
             received_chain = certs.received_certificate_chain
         else:
             raise Exception("Missing sslyze function for received certificate chain")
-        for tlsa_record in domain.mx_tlsa_records:
-            if tlsa_record.usage == 3:
-                pass
-            elif tlsa_record.usage == 1:
-                # Check if cert is trusted
-                if not cert_is_trusted:
-                    cert_tlsa_match = False
-            else:
-                cert_tlsa_match = False
-                handle_error("STARTTLS_TLSA", domain, "Only TLSA Usage types 1 and 3 are currently implemented.")
+        """
 
-            data = None
-            if tlsa_record.selector == 0:
-                data = received_chain[0].public_bytes(serialization.Encoding.DER)
-            elif tlsa_record.selector == 1:
-                data = received_chain[0].public_key().public_bytes(serialization.Encoding.DER, format=serialization.PublicFormat.SubjectPublicKeyInfo)
-            else:
-                cert_tlsa_match = False
-                handle_error("STARTTLS_TLSA", domain, "Only TLSA Selector types 0 and 1 are supported.")
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.load_default_certs()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        # later for checking trust
+        #context.verify_mode = ssl.CERT_REQUIRED
+        #context.check_hostname = True
+        smtp_connection._host = mail_server
+        smtp_connection.starttls(context=context)
+        #smtp_connection.ehlo()
+        #cert_obj = smtp_connection.sock.getpeercert()
+        der = smtp_connection.sock.getpeercert(binary_form=True)
+        scert = crypto.x509.load_der_x509_certificate(der, default_backend())
+        # TODO: what if the cert is not trusted?  Will the starttls fail automatically?
+        
+        for rrset in domain.mx_tlsa_records:
+            for tlsa_record in rrset:
+                if tlsa_record.usage == 3:
+                    pass
+                elif tlsa_record.usage == 1:
+                    # TODO: Check if cert is trusted
+                    #if not cert_is_trusted:
+                    #domain.mx_tlsa_records_match_smtp_certificate = False
+                    cert_tlsa_check = False
+                    handle_error("STARTTLS_TLSA", domain, "Only TLSA Usage type 3 is currently implemented.")
+                else:
+                    cert_tlsa_check = False
+                    handle_error("STARTTLS_TLSA", domain, "Only TLSA Usage type 3 is currently implemented.")
 
-            hashed = None
-            if tlsa_record.mtype == 0:
-                hashed = data
-            elif tlsa_record.mtype == 1:
-                hashed = hashlib.sha256(data).digest()
-            elif tlsa_record.mtype == 2:
-                hashed = hashlib.sha512(data).digest()
-            else:
-                cert_tlsa_match = False
-                handle_error("STARTTLS_TLSA", domain, "Only TLSA Matching types 0, 1, and 2 are supported.")
+                data = None
+                if tlsa_record.selector == 0:
+                    #data = received_chain[0].public_bytes(serialization.Encoding.DER)
+                    data = scert.public_bytes(serialization.Encoding.DER)
+                elif tlsa_record.selector == 1:
+                    #data = received_chain[0].public_key().public_bytes(serialization.Encoding.DER, format=serialization.PublicFormat.SubjectPublicKeyInfo)
+                    data = scert.public_key().public_bytes(serialization.Encoding.DER, format=serialization.PublicFormat.SubjectPublicKeyInfo)
+                else:
+                    cert_tlsa_check = False
+                    handle_error("STARTTLS_TLSA", domain, "Only TLSA Selector types 0 and 1 are supported.")
 
-            # For now, if any TLSA record matches any mail server, then the match is True,
-            # but it should probably be if all mail servers match a TLSA record then the match is True
-            if cert_tlsa_match != False and hashed and hashed == tlsa_record.cert:
-                domain.mx_tlsa_records_match_smtp_certificate = True
-                logging.debug("{}: Found TLSA record matches STARTTLS certificate for mail server {}.".format(domain.domain_name, mail_server))
-                return
+                hashed = None
+                if tlsa_record.mtype == 0:
+                    hashed = data
+                elif tlsa_record.mtype == 1:
+                    hashed = hashlib.sha256(data).digest()
+                elif tlsa_record.mtype == 2:
+                    hashed = hashlib.sha512(data).digest()
+                else:
+                    cert_tlsa_check = False
+                    handle_error("STARTTLS_TLSA", domain, "Only TLSA Matching types 0, 1, and 2 are supported.")
+
+                logging.debug("{}: Found cert data for usage {}, selector {}, and mtype {} to be '{}'.".format(domain.domain_name, tlsa_record.usage, tlsa_record.selector, tlsa_record.mtype, binascii.b2a_hex(hashed)))
+
+                # For now, if any TLSA record matches any mail server, then the match is True,
+                # but it should probably be if all mail servers match a TLSA record then the match is True
+                if cert_tlsa_check != False and hashed and hashed == tlsa_record.cert:
+                    domain.mx_tlsa_records_match_smtp_certificate = True
+                    logging.debug("{}: Found TLSA record matches STARTTLS certificate for mail server {}.".format(domain.domain_name, mail_server))
+                    return
+                else:
+                    logging.debug("{}: TLSA record does not match STARTTLS certificate for mail server {}.".format(domain.domain_name, mail_server))
 
         # No TLSA records matched the STARTTLS cert, so the match is False (unless we've had matches for other mail servers previously)
-        if domain.mx_tlsa_records_match_smtp_certificate is None:
+        if cert_tlsa_check is True and domain.mx_tlsa_records_match_smtp_certificate is None:
             domain.mx_tlsa_records_match_smtp_certificate = False
     except Exception as error:
         handle_error('STARTTLS_TLSA', domain, error)
@@ -528,6 +562,10 @@ def starttls_scan(domain, smtp_timeout, smtp_localhost, smtp_ports, smtp_cache):
                 domain.starttls_results[server_and_port]['starttls'] = has_starttls
                 logging.debug('\t Supports STARTTLS: ' + str(has_starttls))
 
+                # If there is a TLSA record, check and see if the TLSA record matches the STARTTLS cert
+                if domain.mx_tlsa_records:
+                    check_starttls_tlsa(domain, smtp_connection, smtp_timeout, mail_server, port)
+
                 # Close the connection
                 # smtplib freaks out if you call quit on a non-open
                 # connection
@@ -539,10 +577,6 @@ def starttls_scan(domain, smtp_timeout, smtp_localhost, smtp_ports, smtp_cache):
                 # Copy the results into the cache, if necessary
                 if smtp_cache:
                     _SMTP_CACHE[server_and_port] = domain.starttls_results[server_and_port]
-
-                # If there is a TLSA record, check and see if the TLSA record matches the STARTTLS cert
-                if domain.mx_tlsa_records:
-                    check_starttls_tlsa(domain, smtp_timeout, mail_server, port)
 
             else:
                 logging.debug('\tUsing cached results for ' + server_and_port)
@@ -1141,7 +1175,7 @@ def handle_error(prefix, domain, error, syntax_error=False):
             domain.syntax_errors.append(error_string)
         else:
             domain.debug_info.append(error_string)
-    logging.debug(error_string)
+    logging.debug("{}: {}".format(domain.domain_name, error_string))
     #if error is not None and isinstance(error, Exception):
     #    logging.debug("Error is an Exception:  ")
     #    logging.debug(traceback.format_tb(error.__traceback__))
