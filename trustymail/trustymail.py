@@ -917,10 +917,11 @@ def dmarc_scan(resolver, domain):
                 domain.dmarc_has_forensic_uri = False
 
             for tag in tag_dict:
-                if tag not in ['v', 'mailto', 'rf', 'p', 'sp', 'np', 'adkim', 'aspf', 'fo', 'pct', 'ri', 'rua', 'ruf']:
+                if tag not in ['v', 'mailto', 'rf', 'p', 'sp', 'np', 'psd', 'adkim', 'aspf', 'fo', 'pct', 'ri', 'rua', 'ruf']:
                     msg = 'Unknown DMARC tag {0}'.format(tag)
                     handle_syntax_error('[DMARC]', domain, '{0}'.format(msg))
-                    domain.valid_dmarc = False
+                    # other unknown tags are allowed. they should be ignored.
+                    domain.valid_dmarc = True
                 elif tag == 'p':
                     if tag_dict[tag] not in ['none', 'quarantine', 'reject']:
                         msg = 'Unknown DMARC policy {0}'.format(tag)
