@@ -1,8 +1,9 @@
 from datetime import datetime, timedelta
 from collections import OrderedDict
 from os import path, stat
-
-import publicsuffix
+import logging
+# import publicsuffix deprecated
+from publicsuffixlist.compat import PublicSuffixList
 
 from trustymail import PublicSuffixListReadOnly
 from trustymail import PublicSuffixListFilename
@@ -19,21 +20,21 @@ def get_psl():
     """
 
     def download_psl():
-        fresh_psl = publicsuffix.fetch()
-        with open(PublicSuffixListFilename, 'w', encoding='utf-8') as fresh_psl_file:
-            fresh_psl_file.write(fresh_psl.read())
+        # fresh_psl = publicsuffix.fetch() # deprecated
+        from publicsuffixlist.update import updatePSL
+        updatePSL()
 
     # Download the psl if necessary
     if not PublicSuffixListReadOnly:
-        if not path.exists(PublicSuffixListFilename):
+        from publicsuffixlist import PSLFILE
+        if not path.exists(PSLFILE):
             download_psl()
         else:
-            psl_age = datetime.now() - datetime.fromtimestamp(stat(PublicSuffixListFilename).st_mtime)
+            psl_age = datetime.now() - datetime.fromtimestamp(stat(PSLFILE).st_mtime)
             if psl_age > timedelta(hours=24):
                 download_psl()
 
-    with open(PublicSuffixListFilename, encoding='utf-8') as psl_file:
-        psl = publicsuffix.PublicSuffixList(psl_file)
+        psl = PublicSuffixList()
 
     return psl
 
@@ -65,15 +66,22 @@ class Domain:
 
         self.base_domain_name = get_public_suffix(self.domain_name)
 
+        logging.debug('{}: base_domain_name = {}'.format(self.domain_name, self.base_domain_name))
+
         self.is_base_domain = True
         self.base_domain = None
         if self.base_domain_name != self.domain_name:
             self.is_base_domain = False
+            logging.debug('{}: domain_name != base_domain_name, so is_base_domain should be False'.format(self.domain_name))
             if self.base_domain_name not in Domain.base_domains:
                 # Populate DMARC for parent.
                 domain = trustymail.scan(self.base_domain_name, timeout, smtp_timeout, smtp_localhost, smtp_ports, smtp_cache, {'mx': False, 'starttls': False, 'spf': False, 'dmarc': True}, dns_hostnames)
                 Domain.base_domains[self.base_domain_name] = domain
             self.base_domain = Domain.base_domains[self.base_domain_name]
+        else:
+            logging.debug('{}: domain_name == base_domain_name, so is_base_domain should be True'.format(self.domain_name))
+
+        logging.debug('{}: is_base_domain = {}, base_domain = {}'.format(self.domain_name, self.is_base_domain, self.base_domain))
 
         # Start off assuming the host is live unless an error tells us otherwise.
         self.is_live = True
@@ -177,6 +185,7 @@ class Domain:
         ans = self.has_dmarc()
         if self.base_domain:
             ans = self.base_domain.has_dmarc()
+        logging.debug('{}: parent_has_dmarc = {}'.format(self.domain_name, ans))
         return ans
 
     def parent_dmarc_dnssec(self):
@@ -189,12 +198,14 @@ class Domain:
         ans = self.valid_dmarc
         if self.base_domain:
             return self.base_domain.valid_dmarc
+        logging.debug('{}: parent_valid_dmarc = {}'.format(self.domain_name, ans))
         return ans
 
     def parent_dmarc_results(self):
         ans = format_list(self.dmarc)
         if self.base_domain:
             ans = format_list(self.base_domain.dmarc)
+        logging.debug('{}: parent_dmarc_results = {}'.format(self.domain_name, ans))
         return ans
 
     def get_dmarc_policy(self):
