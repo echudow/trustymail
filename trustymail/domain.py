@@ -2,6 +2,7 @@ from datetime import datetime, timedelta
 from collections import OrderedDict
 from os import path, stat
 import logging
+import threading
 # import publicsuffix deprecated
 from publicsuffixlist.compat import PublicSuffixList
 
@@ -9,6 +10,11 @@ from trustymail import PublicSuffixListReadOnly
 from trustymail import PublicSuffixListFilename
 from trustymail import trustymail
 
+# Synchronization lock between threads to ensure that only one thread runs the
+# initialization function, but that all threads wait for it to finish before
+# they continue
+init_lock = threading.RLock()
+suffix_list = None
 
 def get_psl():
     """
@@ -18,11 +24,21 @@ def get_psl():
     -------
     PublicSuffixList: An instance of PublicSuffixList loaded with a cached or updated list
     """
+    global suffix_list
 
     def download_psl():
+        global suffix_list
         # fresh_psl = publicsuffix.fetch() # deprecated
+        init_lock.acquire()
+        if suffix_list is not None:
+            init_lock.release()
+            return
+
         from publicsuffixlist.update import updatePSL
         updatePSL()
+        suffix_list = PublicSuffixList()
+        init_lock.release()
+        return
 
     # Download the psl if necessary
     if not PublicSuffixListReadOnly:
@@ -34,7 +50,7 @@ def get_psl():
             if psl_age > timedelta(hours=24):
                 download_psl()
 
-        psl = PublicSuffixList()
+    psl = suffix_list
 
     return psl
 
