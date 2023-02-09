@@ -50,6 +50,7 @@ def get_psl():
             if psl_age > timedelta(hours=24):
                 download_psl()
 
+    suffix_list = PublicSuffixList()
     psl = suffix_list
 
     return psl
