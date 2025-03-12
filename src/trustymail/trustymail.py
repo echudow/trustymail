@@ -595,7 +595,7 @@ def find_spf_ips(domain, domain_name, spf_record_text):
     if not spf_record_text:
         result, answer, _ = do_dns_lookup(domain, domain_name, 'TXT')
         if result != DNSLookupResult.NOERROR:
-            return 0
+            return ips
         spf_record_text = str(answer)
     if "v=spf1" in str(spf_record_text):
         for match in re_includes.finditer(spf_record_text):
@@ -628,6 +628,7 @@ def count_spf_ips(domain, domain_name, spf_record_text):
         domain.spf_ips = ips
         domain.spf_count_ips = count
     except Exception as error:
+        logging.debug("%s: SPF count error: %s", domain_name, error)
         handle_error("[SPF IPs]", domain, error)
     return 
 
